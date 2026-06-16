@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CodeBuddy - AI GitHub PR Auto Review Agent
+
+Parameters:
+  AgentId:
+    Type: String
+    Description: Bedrock Agent ID
+  AliasId:
+    Type: String
+    Description: Bedrock Agent Alias ID
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub Personal Access Token
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Slack Incoming Webhook URL (optional)
+  LambdaRoleArn:
+    Type: String
+    Description: Lambda execution role ARN
+
+Resources:
+
+  # ── Orchestrator Lambda ──
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: codebuddy-orchestrator
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref LambdaRoleArn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          AGENT_ID: !Ref AgentId
+          ALIAS_ID: !Ref AliasId
+          GITHUB_WEBHOOK_SECRET: ''
+      Code:
+        ZipFile: |
+          import json, boto3, os
+          from botocore.config import Config
+
+          def handler(event, context):
+              body_str = event.get("body", "") or ""
+              try:
+                  body = json.loads(body_str)
+              except:
+                  return {"statusCode": 400, "body": "Invalid JSON"}
+
+              action = body.get("action", "")
+              pr_url = (body.get("pull_request") or {}).get("html_url", "")
+
+              if not pr_url or action not in ("opened", "synchronize"):
+                  return {"statusCode": 200, "body": f"Skipped: {action}"}
+
+              bedrock_rt = boto3.client("bedrock-agent-runtime",
+                  region_name="ap-northeast-2",
+                  config=Config(read_timeout=300))
+
+              resp = bedrock_rt.invoke_agent(
+                  agentId=os.environ["AGENT_ID"],
+                  agentAliasId=os.environ["ALIAS_ID"],
+                  sessionId=f"webhook-{pr_url.split('/')[-1]}",
+                  inputText=f"{pr_url} 이 PR을 리뷰해주세요"
+              )
+
+              result = ""
+              for chunk in resp["completion"]:
+                  if "chunk" in chunk:
+                      result += chunk["chunk"]["bytes"].decode()
+
+              return {"statusCode": 200,
+                      "body": json.dumps({"status": "success", "message": result[:500]})}
+
+  # ── API Gateway ──
+  CodeBuddyApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CodeBuddyAPI
+      Description: CodeBuddy PR Review Webhook Endpoint
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      ParentId: !GetAtt CodeBuddyApi.RootResourceId
+      PathPart: review
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt OrchestratorLambda.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref CodeBuddyApi
+      StageName: prod
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CodeBuddyApi}/*/POST/review
+
+Outputs:
+  WebhookUrl:
+    Description: GitHub Webhook URL
+    Value: !Sub https://${CodeBuddyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/review
+  OrchestratorArn:
+    Description: Orchestrator Lambda ARN
+    Value: !GetAtt OrchestratorLambda.Arn

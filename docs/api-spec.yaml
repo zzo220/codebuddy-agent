@@ -1,0 +1,41 @@
+openapi: 3.0.0
+info:
+  title: CodeBuddy API
+  version: 1.0.0
+  description: AI GitHub PR 자동 리뷰 에이전트 API
+
+paths:
+  /review:
+    post:
+      summary: GitHub PR 리뷰 요청
+      description: GitHub Webhook 또는 직접 호출로 PR 자동 리뷰 실행
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pr_url:
+                  type: string
+                  example: "https://github.com/owner/repo/pull/1"
+                action:
+                  type: string
+                  example: "opened"
+      responses:
+        "200":
+          description: 리뷰 완료
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  message:
+                    type: string
+        "400":
+          description: 잘못된 요청
+        "500":
+          description: 서버 오류
